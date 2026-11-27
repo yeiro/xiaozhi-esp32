@@ -102,8 +102,28 @@ private:
     float speak_blend_ = 0.0f;
     float listen_blend_ = 0.0f;
     int64_t last_tap_us_ = 0;
+    int64_t last_activity_us_ = 0;
+    bool screen_sleeping_ = false;
     int last_watch_sec_ = -1;
     std::atomic<int> caracas_temp_c_{-999};
+
+    void WakeScreen() {
+        last_activity_us_ = esp_timer_get_time();
+        if (screen_sleeping_) {
+            screen_sleeping_ = false;
+            Board::GetInstance().GetBacklight()->RestoreBrightness();
+            if (orb_obj_) {
+                lv_obj_invalidate(orb_obj_);
+            }
+        }
+    }
+
+    void SleepScreen() {
+        if (!screen_sleeping_) {
+            screen_sleeping_ = true;
+            Board::GetInstance().GetBacklight()->SetBrightness(0);
+        }
+    }
 
     static void weather_fetch_task(void* arg) {
         auto* self = static_cast<CustomLcdDisplay*>(arg);
@@ -279,8 +299,15 @@ private:
         auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
         if (!self) return;
         int64_t now_us = esp_timer_get_time();
-        // Wake screen on any tap
-        Board::GetInstance().GetBacklight()->RestoreBrightness();
+
+        // 1-tap wakes up the AMOLED screen immediately from sleep
+        if (self->screen_sleeping_) {
+            self->WakeScreen();
+            self->last_tap_us_ = now_us;
+            return;
+        }
+
+        self->last_activity_us_ = now_us;
         // Double-tap (< 450 ms) triggers the same action as the BOOT button
         if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 450000) {
             self->last_tap_us_ = 0;
@@ -296,7 +323,22 @@ private:
         auto* self = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
         if (!self || !self->orb_obj_) return;
 
+        int64_t now_us = esp_timer_get_time();
         auto state = Application::GetInstance().GetDeviceState();
+
+        // Any active state wakes up the AMOLED screen automatically (e.g. "Hi, ESP")
+        if (state != kDeviceStateIdle) {
+            self->WakeScreen();
+        } else {
+            // Auto screen-off after 25 seconds in idle to save battery on AMOLED
+            if (!self->screen_sleeping_ && self->last_activity_us_ > 0 &&
+                (now_us - self->last_activity_us_) > 25000000LL) {
+                self->SleepScreen();
+            }
+            if (self->screen_sleeping_) {
+                return; // Skip redrawing while AMOLED is off -> ultra-low power!
+            }
+        }
         float target_energy = 0.08f;
         float target_speak = 0.0f;
         float target_listen = 0.0f;
@@ -544,6 +586,7 @@ public:
         lv_obj_add_event_cb(orb_obj_, orb_draw_cb, LV_EVENT_DRAW_MAIN, this);
         lv_obj_add_event_cb(orb_obj_, orb_click_cb, LV_EVENT_CLICKED, this);
 
+        last_activity_us_ = esp_timer_get_time();
         orb_timer_ = lv_timer_create(orb_timer_cb, 33, this);
         xTaskCreate(weather_fetch_task, "weather_ccs", 4096, this, 1, nullptr);
     }
