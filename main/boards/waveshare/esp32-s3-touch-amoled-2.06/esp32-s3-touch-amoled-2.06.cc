@@ -92,6 +92,9 @@ private:
     std::array<Vec3, kNumParticles> base_points_;
     lv_obj_t* orb_obj_ = nullptr;
     lv_obj_t* watch_header_ = nullptr;
+    lv_obj_t* watch_status_row_ = nullptr;
+    lv_obj_t* watch_wifi_label_ = nullptr;
+    lv_obj_t* watch_bat_label_ = nullptr;
     lv_obj_t* watch_time_label_ = nullptr;
     lv_obj_t* watch_info_label_ = nullptr;
     lv_timer_t* orb_timer_ = nullptr;
@@ -203,6 +206,27 @@ private:
                      kMonthsEs[tm_now.tm_mon % 12], ampm);
         }
         lv_label_set_text(watch_info_label_, info_buf);
+
+        // Update crisp visible Battery % & Wi-Fi indicator inside the safe flat area of the AMOLED
+        if (watch_bat_label_) {
+            int bat_lvl = 0;
+            bool chg = false, dischg = false;
+            if (Board::GetInstance().GetBatteryLevel(bat_lvl, chg, dischg)) {
+                char bat_buf[24];
+                snprintf(bat_buf, sizeof(bat_buf), chg ? "BAT %d%% +" : "BAT %d%%", bat_lvl);
+                lv_label_set_text(watch_bat_label_, bat_buf);
+                lv_color_t bat_col = chg ? lv_color_hex(0x38BDF8)
+                                         : (bat_lvl <= 20 ? lv_color_hex(0xF87171) : lv_color_hex(0x34D399));
+                lv_obj_set_style_text_color(watch_bat_label_, bat_col, 0);
+            }
+        }
+        if (watch_wifi_label_) {
+            auto st = Application::GetInstance().GetDeviceState();
+            bool online = (st != kDeviceStateStarting && st != kDeviceStateWifiConfiguring);
+            lv_label_set_text(watch_wifi_label_, online ? "WiFi ON" : "WiFi...");
+            lv_obj_set_style_text_color(watch_wifi_label_,
+                                        online ? lv_color_hex(0x60A5FA) : lv_color_hex(0x94A3B8), 0);
+        }
     }
 
     void InitFibonacciSphere() {
@@ -271,15 +295,13 @@ private:
             lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
         }
         if (top_bar_) {
-            lv_obj_set_style_bg_color(top_bar_, black, 0);
-            lv_obj_set_style_bg_opa(top_bar_, LV_OPA_COVER, 0);
-            lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.08, 0);
-            lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.08, 0);
+            // Hide default corner-clipped top_bar_ (we render crisp WiFi + Battery % in safe area)
+            lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
         }
         if (status_bar_) {
-            // MUST remain transparent so top_bar_ (Wi-Fi & Battery icons) stays visible!
             lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
             lv_obj_set_style_text_color(status_bar_, text_light, 0);
+            lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 8);
         }
         if (content_) {
             lv_obj_set_style_bg_color(content_, black, 0);
@@ -305,11 +327,6 @@ private:
         if (!self) return;
         int64_t now_us = esp_timer_get_time();
 
-        // Debounce rapid hardware touch bounce (< 80 ms)
-        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 80000) {
-            return;
-        }
-
         // 1-tap wakes up the AMOLED screen immediately from sleep
         if (self->screen_sleeping_) {
             ESP_LOGI(TAG, "Touch 1-tap -> Wake AMOLED screen");
@@ -319,8 +336,8 @@ private:
         }
 
         self->last_activity_us_ = now_us;
-        // Double-tap (80 ms .. 480 ms) triggers the same action as the BOOT button
-        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 480000) {
+        // Double-tap (<= 650 ms between finger releases) triggers BOOT ToggleChatState
+        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) <= 650000) {
             ESP_LOGI(TAG, "Touch Double-tap -> ToggleChatState");
             self->last_tap_us_ = 0;
             self->tap_pulse_ = 1.0f;
@@ -568,11 +585,29 @@ public:
 
         lv_obj_t* screen = lv_screen_active();
 
+        // Safe-area Smartwatch Status Row (WiFi ON  |  BAT 98%) well inside rounded corners
+        watch_status_row_ = lv_obj_create(screen);
+        lv_obj_remove_style_all(watch_status_row_);
+        lv_obj_set_size(watch_status_row_, LV_HOR_RES - 88, LV_SIZE_CONTENT);
+        lv_obj_align(watch_status_row_, LV_ALIGN_TOP_MID, 0, 26);
+        lv_obj_set_flex_flow(watch_status_row_, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(watch_status_row_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        watch_wifi_label_ = lv_label_create(watch_status_row_);
+        lv_obj_set_style_text_font(watch_wifi_label_, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(watch_wifi_label_, lv_color_hex(0x60A5FA), 0);
+        lv_label_set_text(watch_wifi_label_, "WiFi...");
+
+        watch_bat_label_ = lv_label_create(watch_status_row_);
+        lv_obj_set_style_text_font(watch_bat_label_, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(watch_bat_label_, lv_color_hex(0x34D399), 0);
+        lv_label_set_text(watch_bat_label_, "BAT --%");
+
         // Smartwatch Header: Big crisp clock + Date + Live Caracas Temperature (explicit full width!)
         watch_header_ = lv_obj_create(screen);
         lv_obj_remove_style_all(watch_header_);
         lv_obj_set_size(watch_header_, LV_HOR_RES, LV_SIZE_CONTENT);
-        lv_obj_align(watch_header_, LV_ALIGN_TOP_MID, 0, 48);
+        lv_obj_align(watch_header_, LV_ALIGN_TOP_MID, 0, 58);
         lv_obj_set_flex_flow(watch_header_, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(watch_header_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(watch_header_, 4, 0);
@@ -590,12 +625,11 @@ public:
         // Create interactive 3D Particle & Voice-Wave Orb centered below the watch header
         orb_obj_ = lv_obj_create(screen);
         lv_obj_remove_style_all(orb_obj_);
-        lv_obj_set_size(orb_obj_, 250, 250);
-        lv_obj_align(orb_obj_, LV_ALIGN_CENTER, 0, 52);
+        lv_obj_set_size(orb_obj_, 240, 240);
+        lv_obj_align(orb_obj_, LV_ALIGN_CENTER, 0, 62);
         lv_obj_add_event_cb(orb_obj_, orb_draw_cb, LV_EVENT_DRAW_MAIN, this);
 
-        // Keep top_bar_, status_bar_, bottom_bar_ above background
-        if (top_bar_) lv_obj_move_foreground(top_bar_);
+        // Keep status_bar_ and bottom_bar_ above background
         if (status_bar_) lv_obj_move_foreground(status_bar_);
         if (bottom_bar_) lv_obj_move_foreground(bottom_bar_);
 
@@ -607,8 +641,9 @@ public:
     void AttachTouchIndev(lv_indev_t* indev) {
         if (!indev) return;
         DisplayLockGuard lock(this);
-        lv_indev_add_event_cb(indev, touch_indev_cb, LV_EVENT_PRESSED, this);
-        ESP_LOGI(TAG, "Global touch indev listener attached (1-tap wake / double-tap talk)");
+        // Use LV_EVENT_RELEASED: fires exactly once per finger tap with zero bounce!
+        lv_indev_add_event_cb(indev, touch_indev_cb, LV_EVENT_RELEASED, this);
+        ESP_LOGI(TAG, "Global touch indev listener attached (1-tap wake / double-tap talk on RELEASED)");
     }
 
     virtual bool SetEmotion(const char* emotion) override {
