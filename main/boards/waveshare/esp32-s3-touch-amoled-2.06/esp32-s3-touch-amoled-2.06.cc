@@ -258,8 +258,8 @@ private:
 
     void ApplyAmoledBlackTheme() {
         lv_color_t black = lv_color_hex(0x000000);
-        lv_color_t text_light = lv_color_hex(0xE2E8F0);
-        lv_color_t text_muted = lv_color_hex(0x94A3B8);
+        lv_color_t text_light = lv_color_hex(0xF1F5F9);
+        lv_color_t icon_accent = lv_color_hex(0x93C5FD);
 
         lv_obj_t* screen = lv_screen_active();
         if (screen) {
@@ -270,9 +270,15 @@ private:
             lv_obj_set_style_bg_color(container_, black, 0);
             lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
         }
+        if (top_bar_) {
+            lv_obj_set_style_bg_color(top_bar_, black, 0);
+            lv_obj_set_style_bg_opa(top_bar_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.08, 0);
+            lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.08, 0);
+        }
         if (status_bar_) {
-            lv_obj_set_style_bg_color(status_bar_, black, 0);
-            lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);
+            // MUST remain transparent so top_bar_ (Wi-Fi & Battery icons) stays visible!
+            lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
             lv_obj_set_style_text_color(status_bar_, text_light, 0);
         }
         if (content_) {
@@ -280,42 +286,48 @@ private:
             lv_obj_set_style_bg_opa(content_, LV_OPA_COVER, 0);
         }
         if (emoji_box_) {
-            lv_obj_set_style_bg_color(emoji_box_, black, 0);
-            lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
         }
         if (bottom_bar_) {
             lv_obj_set_style_bg_color(bottom_bar_, black, 0);
-            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
         }
         if (status_label_) lv_obj_set_style_text_color(status_label_, text_light, 0);
-        if (network_label_) lv_obj_set_style_text_color(network_label_, text_muted, 0);
-        if (battery_label_) lv_obj_set_style_text_color(battery_label_, text_muted, 0);
+        if (network_label_) lv_obj_set_style_text_color(network_label_, icon_accent, 0);
+        if (battery_label_) lv_obj_set_style_text_color(battery_label_, lv_color_hex(0x34D399), 0);
         if (chat_message_label_) lv_obj_set_style_text_color(chat_message_label_, text_light, 0);
         if (emoji_label_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         if (emoji_image_) lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     }
 
-    static void orb_click_cb(lv_event_t* e) {
+    static void touch_indev_cb(lv_event_t* e) {
         auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
         if (!self) return;
         int64_t now_us = esp_timer_get_time();
 
+        // Debounce rapid hardware touch bounce (< 80 ms)
+        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 80000) {
+            return;
+        }
+
         // 1-tap wakes up the AMOLED screen immediately from sleep
         if (self->screen_sleeping_) {
+            ESP_LOGI(TAG, "Touch 1-tap -> Wake AMOLED screen");
             self->WakeScreen();
             self->last_tap_us_ = now_us;
             return;
         }
 
         self->last_activity_us_ = now_us;
-        // Double-tap (< 450 ms) triggers the same action as the BOOT button
-        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 450000) {
+        // Double-tap (80 ms .. 480 ms) triggers the same action as the BOOT button
+        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 480000) {
+            ESP_LOGI(TAG, "Touch Double-tap -> ToggleChatState");
             self->last_tap_us_ = 0;
             self->tap_pulse_ = 1.0f;
-            auto& app = Application::GetInstance();
-            app.ToggleChatState();
+            Application::GetInstance().ToggleChatState();
         } else {
             self->last_tap_us_ = now_us;
+            self->tap_pulse_ = 0.45f; // Subtle visual feedback on single tap
         }
     }
 
@@ -554,19 +566,16 @@ public:
 
         ApplyAmoledBlackTheme();
 
-        // Smartwatch Header: Big crisp clock + Date + Live Caracas Temperature
-        lv_obj_t* parent = emoji_box_ ? emoji_box_ : content_;
-        lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(parent, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_t* screen = lv_screen_active();
 
-        watch_header_ = lv_obj_create(parent);
+        // Smartwatch Header: Big crisp clock + Date + Live Caracas Temperature (explicit full width!)
+        watch_header_ = lv_obj_create(screen);
         lv_obj_remove_style_all(watch_header_);
-        lv_obj_set_size(watch_header_, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_size(watch_header_, LV_HOR_RES, LV_SIZE_CONTENT);
+        lv_obj_align(watch_header_, LV_ALIGN_TOP_MID, 0, 48);
         lv_obj_set_flex_flow(watch_header_, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(watch_header_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(watch_header_, 4, 0);
-        lv_obj_add_flag(watch_header_, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(watch_header_, orb_click_cb, LV_EVENT_CLICKED, this);
 
         watch_time_label_ = lv_label_create(watch_header_);
         lv_obj_set_style_text_font(watch_time_label_, &lv_font_montserrat_48, 0);
@@ -578,22 +587,34 @@ public:
         lv_obj_set_style_text_color(watch_info_label_, lv_color_hex(0x7DD3FC), 0);
         lv_label_set_text(watch_info_label_, "Caracas, VE");
 
-        // Create interactive 3D Particle & Voice-Wave Orb below the watch clock
-        orb_obj_ = lv_obj_create(parent);
+        // Create interactive 3D Particle & Voice-Wave Orb centered below the watch header
+        orb_obj_ = lv_obj_create(screen);
         lv_obj_remove_style_all(orb_obj_);
-        lv_obj_set_size(orb_obj_, 240, 240);
-        lv_obj_add_flag(orb_obj_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(orb_obj_, 250, 250);
+        lv_obj_align(orb_obj_, LV_ALIGN_CENTER, 0, 52);
         lv_obj_add_event_cb(orb_obj_, orb_draw_cb, LV_EVENT_DRAW_MAIN, this);
-        lv_obj_add_event_cb(orb_obj_, orb_click_cb, LV_EVENT_CLICKED, this);
+
+        // Keep top_bar_, status_bar_, bottom_bar_ above background
+        if (top_bar_) lv_obj_move_foreground(top_bar_);
+        if (status_bar_) lv_obj_move_foreground(status_bar_);
+        if (bottom_bar_) lv_obj_move_foreground(bottom_bar_);
 
         last_activity_us_ = esp_timer_get_time();
         orb_timer_ = lv_timer_create(orb_timer_cb, 33, this);
         xTaskCreate(weather_fetch_task, "weather_ccs", 4096, this, 1, nullptr);
     }
 
-    virtual bool SetEmotion(const char* emotion) override {
-        // Keep our 3D glowing orb visible instead of default emoji faces
+    void AttachTouchIndev(lv_indev_t* indev) {
+        if (!indev) return;
         DisplayLockGuard lock(this);
+        lv_indev_add_event_cb(indev, touch_indev_cb, LV_EVENT_PRESSED, this);
+        ESP_LOGI(TAG, "Global touch indev listener attached (1-tap wake / double-tap talk)");
+    }
+
+    virtual bool SetEmotion(const char* emotion) override {
+        // Keep our 3D glowing orb visible instead of default emoji faces/GIFs
+        DisplayLockGuard lock(this);
+        if (emoji_box_) lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
         if (emoji_label_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
         if (emoji_image_) lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
         return true;
@@ -778,7 +799,10 @@ private:
             .disp = lv_display_get_default(),
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        lv_indev_t* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (display_ && touch_indev) {
+            display_->AttachTouchIndev(touch_indev);
+        }
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
