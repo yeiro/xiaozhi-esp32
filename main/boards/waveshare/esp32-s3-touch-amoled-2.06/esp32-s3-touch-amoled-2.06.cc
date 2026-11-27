@@ -22,8 +22,14 @@
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 #include <cmath>
+#include <ctime>
+#include <cstdlib>
+#include <cstdio>
+#include <atomic>
 #include <array>
 #include <algorithm>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
@@ -85,6 +91,9 @@ private:
     };
     std::array<Vec3, kNumParticles> base_points_;
     lv_obj_t* orb_obj_ = nullptr;
+    lv_obj_t* watch_header_ = nullptr;
+    lv_obj_t* watch_time_label_ = nullptr;
+    lv_obj_t* watch_info_label_ = nullptr;
     lv_timer_t* orb_timer_ = nullptr;
     float phase_ = 0.0f;
     float rot_y_ = 0.0f;
@@ -92,6 +101,89 @@ private:
     float tap_pulse_ = 0.0f;
     float speak_blend_ = 0.0f;
     float listen_blend_ = 0.0f;
+    int64_t last_tap_us_ = 0;
+    int last_watch_sec_ = -1;
+    std::atomic<int> caracas_temp_c_{-999};
+
+    static void weather_fetch_task(void* arg) {
+        auto* self = static_cast<CustomLcdDisplay*>(arg);
+        // Wait for Wi-Fi connection before first fetch
+        vTaskDelay(pdMS_TO_TICKS(8000));
+        while (true) {
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state != kDeviceStateStarting && state != kDeviceStateWifiConfiguring) {
+                auto network = Board::GetInstance().GetNetwork();
+                if (network) {
+                    auto http = network->CreateHttp(0);
+                    if (http) {
+                        const char* url = "http://api.open-meteo.com/v1/forecast?latitude=10.4806&longitude=-66.9036&current=temperature_2m";
+                        if (auto opened = http->Open("GET", url); opened) {
+                            std::string body = http->ReadAll();
+                            http->Close();
+                            auto pos = body.rfind("\"temperature_2m\":");
+                            if (pos != std::string::npos) {
+                                float val = std::strtof(body.c_str() + pos + 17, nullptr);
+                                if (val > -50.0f && val < 65.0f) {
+                                    self->caracas_temp_c_.store(static_cast<int>(std::lround(val)));
+                                    ESP_LOGI(TAG, "Caracas temp updated: %d C", self->caracas_temp_c_.load());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Refresh every 15 minutes (or retry in 30s if not fetched yet)
+            vTaskDelay(pdMS_TO_TICKS(self->caracas_temp_c_.load() == -999 ? 30000 : 900000));
+        }
+    }
+
+    void UpdateWatchHeader() {
+        if (!watch_time_label_ || !watch_info_label_) return;
+        time_t now = time(nullptr);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+
+        if (tm_now.tm_year + 1900 < 2024) {
+            // Time not synced yet
+            lv_label_set_text(watch_time_label_, "--:--");
+            int temp = caracas_temp_c_.load();
+            if (temp != -999) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), "Caracas %dC", temp);
+                lv_label_set_text(watch_info_label_, buf);
+            } else {
+                lv_label_set_text(watch_info_label_, "Caracas, VE");
+            }
+            return;
+        }
+
+        if (tm_now.tm_sec == last_watch_sec_) return;
+        last_watch_sec_ = tm_now.tm_sec;
+
+        // 12-hour clean smartwatch format (e.g. 10:05)
+        char time_buf[16];
+        int h12 = tm_now.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(time_buf, sizeof(time_buf), "%02d:%02d", h12, tm_now.tm_min);
+        lv_label_set_text(watch_time_label_, time_buf);
+
+        static const char* kDaysEs[] = {"Dom", "Lun", "Mar", "Mie", "Jue", "Vie", "Sab"};
+        static const char* kMonthsEs[] = {"Ene", "Feb", "Mar", "Abr", "May", "Jun",
+                                          "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"};
+        const char* ampm = (tm_now.tm_hour >= 12) ? "PM" : "AM";
+        int temp = caracas_temp_c_.load();
+        char info_buf[64];
+        if (temp != -999) {
+            snprintf(info_buf, sizeof(info_buf), "%s %d %s %s | Caracas %dC",
+                     kDaysEs[tm_now.tm_wday % 7], tm_now.tm_mday,
+                     kMonthsEs[tm_now.tm_mon % 12], ampm, temp);
+        } else {
+            snprintf(info_buf, sizeof(info_buf), "%s %d %s %s | Caracas",
+                     kDaysEs[tm_now.tm_wday % 7], tm_now.tm_mday,
+                     kMonthsEs[tm_now.tm_mon % 12], ampm);
+        }
+        lv_label_set_text(watch_info_label_, info_buf);
+    }
 
     void InitFibonacciSphere() {
         const float golden_angle = 2.39996323f; // pi * (3 - sqrt(5))
@@ -186,8 +278,18 @@ private:
     static void orb_click_cb(lv_event_t* e) {
         auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
         if (!self) return;
-        self->tap_pulse_ = 1.0f;
-        Application::GetInstance().ToggleChatState();
+        int64_t now_us = esp_timer_get_time();
+        // Wake screen on any tap
+        Board::GetInstance().GetBacklight()->RestoreBrightness();
+        // Double-tap (< 450 ms) triggers the same action as the BOOT button
+        if (self->last_tap_us_ > 0 && (now_us - self->last_tap_us_) < 450000) {
+            self->last_tap_us_ = 0;
+            self->tap_pulse_ = 1.0f;
+            auto& app = Application::GetInstance();
+            app.ToggleChatState();
+        } else {
+            self->last_tap_us_ = now_us;
+        }
     }
 
     static void orb_timer_cb(lv_timer_t* timer) {
@@ -225,6 +327,7 @@ private:
             self->tap_pulse_ = 0.0f;
         }
 
+        self->UpdateWatchHeader();
         lv_obj_invalidate(self->orb_obj_);
     }
 
@@ -409,17 +512,40 @@ public:
 
         ApplyAmoledBlackTheme();
 
-        // Create interactive 3D Particle & Voice-Wave Orb in the center
+        // Smartwatch Header: Big crisp clock + Date + Live Caracas Temperature
         lv_obj_t* parent = emoji_box_ ? emoji_box_ : content_;
+        lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(parent, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        watch_header_ = lv_obj_create(parent);
+        lv_obj_remove_style_all(watch_header_);
+        lv_obj_set_size(watch_header_, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(watch_header_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(watch_header_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(watch_header_, 4, 0);
+        lv_obj_add_flag(watch_header_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(watch_header_, orb_click_cb, LV_EVENT_CLICKED, this);
+
+        watch_time_label_ = lv_label_create(watch_header_);
+        lv_obj_set_style_text_font(watch_time_label_, &lv_font_montserrat_48, 0);
+        lv_obj_set_style_text_color(watch_time_label_, lv_color_hex(0xF8FAFC), 0);
+        lv_label_set_text(watch_time_label_, "--:--");
+
+        watch_info_label_ = lv_label_create(watch_header_);
+        lv_obj_set_style_text_font(watch_info_label_, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(watch_info_label_, lv_color_hex(0x7DD3FC), 0);
+        lv_label_set_text(watch_info_label_, "Caracas, VE");
+
+        // Create interactive 3D Particle & Voice-Wave Orb below the watch clock
         orb_obj_ = lv_obj_create(parent);
         lv_obj_remove_style_all(orb_obj_);
-        lv_obj_set_size(orb_obj_, 310, 310);
-        lv_obj_center(orb_obj_);
+        lv_obj_set_size(orb_obj_, 240, 240);
         lv_obj_add_flag(orb_obj_, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(orb_obj_, orb_draw_cb, LV_EVENT_DRAW_MAIN, this);
         lv_obj_add_event_cb(orb_obj_, orb_click_cb, LV_EVENT_CLICKED, this);
 
         orb_timer_ = lv_timer_create(orb_timer_cb, 33, this);
+        xTaskCreate(weather_fetch_task, "weather_ccs", 4096, this, 1, nullptr);
     }
 
     virtual bool SetEmotion(const char* emotion) override {
