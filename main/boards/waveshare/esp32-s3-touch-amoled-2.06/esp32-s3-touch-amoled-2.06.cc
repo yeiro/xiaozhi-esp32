@@ -21,6 +21,9 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <cmath>
+#include <array>
+#include <algorithm>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
@@ -73,8 +76,291 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
     {0x51, (uint8_t []){0xFF}, 1, 0},
 };
 
-// 在waveshare_amoled_2_06类之前添加新的显示类
+// Custom AMOLED display with 3D glowing particle & voice-wave orb
 class CustomLcdDisplay : public SpiLcdDisplay {
+private:
+    static constexpr int kNumParticles = 96;
+    struct Vec3 {
+        float x, y, z;
+    };
+    std::array<Vec3, kNumParticles> base_points_;
+    lv_obj_t* orb_obj_ = nullptr;
+    lv_timer_t* orb_timer_ = nullptr;
+    float phase_ = 0.0f;
+    float rot_y_ = 0.0f;
+    float energy_ = 0.08f;
+    float tap_pulse_ = 0.0f;
+    float speak_blend_ = 0.0f;
+    float listen_blend_ = 0.0f;
+
+    void InitFibonacciSphere() {
+        const float golden_angle = 2.39996323f; // pi * (3 - sqrt(5))
+        for (int i = 0; i < kNumParticles; ++i) {
+            float y = 1.0f - (static_cast<float>(i) / static_cast<float>(kNumParticles - 1)) * 2.0f;
+            float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+            float theta = golden_angle * static_cast<float>(i);
+            base_points_[i] = {std::cos(theta) * r, y, std::sin(theta) * r};
+        }
+    }
+
+    static uint32_t LerpHex(uint32_t hex_a, uint32_t hex_b, float t) {
+        t = std::clamp(t, 0.0f, 1.0f);
+        uint8_t ra = (hex_a >> 16) & 0xFF, ga = (hex_a >> 8) & 0xFF, ba = hex_a & 0xFF;
+        uint8_t rb = (hex_b >> 16) & 0xFF, gb = (hex_b >> 8) & 0xFF, bb = hex_b & 0xFF;
+        uint8_t r = static_cast<uint8_t>(ra + (rb - ra) * t);
+        uint8_t g = static_cast<uint8_t>(ga + (gb - ga) * t);
+        uint8_t b = static_cast<uint8_t>(ba + (bb - ba) * t);
+        return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+    }
+
+    static lv_color_t LerpColor(uint32_t hex_a, uint32_t hex_b, float t) {
+        return lv_color_hex(LerpHex(hex_a, hex_b, t));
+    }
+
+    static void DrawCircle(lv_layer_t* layer, int32_t cx, int32_t cy, int32_t radius,
+                           lv_color_t color, lv_opa_t opa) {
+        if (radius <= 0 || opa == LV_OPA_TRANSP) return;
+        lv_draw_rect_dsc_t dsc;
+        lv_draw_rect_dsc_init(&dsc);
+        dsc.radius = LV_RADIUS_CIRCLE;
+        dsc.bg_color = color;
+        dsc.bg_opa = opa;
+        dsc.border_width = 0;
+        lv_area_t area = {cx - radius, cy - radius, cx + radius, cy + radius};
+        lv_draw_rect(layer, &dsc, &area);
+    }
+
+    static void DrawRing(lv_layer_t* layer, int32_t cx, int32_t cy, int32_t radius,
+                         int32_t width, lv_color_t color, lv_opa_t opa) {
+        if (radius <= 0 || width <= 0 || opa == LV_OPA_TRANSP) return;
+        lv_draw_rect_dsc_t dsc;
+        lv_draw_rect_dsc_init(&dsc);
+        dsc.radius = LV_RADIUS_CIRCLE;
+        dsc.bg_opa = LV_OPA_TRANSP;
+        dsc.border_width = width;
+        dsc.border_color = color;
+        dsc.border_opa = opa;
+        lv_area_t area = {cx - radius, cy - radius, cx + radius, cy + radius};
+        lv_draw_rect(layer, &dsc, &area);
+    }
+
+    void ApplyAmoledBlackTheme() {
+        lv_color_t black = lv_color_hex(0x000000);
+        lv_color_t text_light = lv_color_hex(0xE2E8F0);
+        lv_color_t text_muted = lv_color_hex(0x94A3B8);
+
+        lv_obj_t* screen = lv_screen_active();
+        if (screen) {
+            lv_obj_set_style_bg_color(screen, black, 0);
+            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+        }
+        if (container_) {
+            lv_obj_set_style_bg_color(container_, black, 0);
+            lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
+        }
+        if (status_bar_) {
+            lv_obj_set_style_bg_color(status_bar_, black, 0);
+            lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(status_bar_, text_light, 0);
+        }
+        if (content_) {
+            lv_obj_set_style_bg_color(content_, black, 0);
+            lv_obj_set_style_bg_opa(content_, LV_OPA_COVER, 0);
+        }
+        if (emoji_box_) {
+            lv_obj_set_style_bg_color(emoji_box_, black, 0);
+            lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
+        }
+        if (bottom_bar_) {
+            lv_obj_set_style_bg_color(bottom_bar_, black, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_COVER, 0);
+        }
+        if (status_label_) lv_obj_set_style_text_color(status_label_, text_light, 0);
+        if (network_label_) lv_obj_set_style_text_color(network_label_, text_muted, 0);
+        if (battery_label_) lv_obj_set_style_text_color(battery_label_, text_muted, 0);
+        if (chat_message_label_) lv_obj_set_style_text_color(chat_message_label_, text_light, 0);
+        if (emoji_label_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        if (emoji_image_) lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    static void orb_click_cb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (!self) return;
+        self->tap_pulse_ = 1.0f;
+        Application::GetInstance().ToggleChatState();
+    }
+
+    static void orb_timer_cb(lv_timer_t* timer) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
+        if (!self || !self->orb_obj_) return;
+
+        auto state = Application::GetInstance().GetDeviceState();
+        float target_energy = 0.08f;
+        float target_speak = 0.0f;
+        float target_listen = 0.0f;
+        float rot_speed = 0.016f;
+
+        if (state == kDeviceStateSpeaking) {
+            target_energy = 1.0f;
+            target_speak = 1.0f;
+            rot_speed = 0.042f;
+        } else if (state == kDeviceStateListening) {
+            target_energy = 0.55f;
+            target_listen = 1.0f;
+            rot_speed = 0.028f;
+        } else if (state == kDeviceStateConnecting || state == kDeviceStateStarting || state == kDeviceStateActivating) {
+            target_energy = 0.35f;
+            rot_speed = 0.050f;
+        }
+
+        // Smooth interpolation for refined, fluid transitions
+        self->energy_ += (target_energy - self->energy_) * 0.14f;
+        self->speak_blend_ += (target_speak - self->speak_blend_) * 0.12f;
+        self->listen_blend_ += (target_listen - self->listen_blend_) * 0.12f;
+        self->phase_ += 0.055f + self->energy_ * 0.045f;
+        self->rot_y_ += rot_speed;
+        if (self->tap_pulse_ > 0.01f) {
+            self->tap_pulse_ *= 0.86f;
+        } else {
+            self->tap_pulse_ = 0.0f;
+        }
+
+        lv_obj_invalidate(self->orb_obj_);
+    }
+
+    static void orb_draw_cb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        lv_layer_t* layer = lv_event_get_layer(e);
+        if (!self || !obj || !layer) return;
+
+        lv_area_t coords;
+        lv_obj_get_coords(obj, &coords);
+        int32_t cx = (coords.x1 + coords.x2) / 2;
+        int32_t cy = (coords.y1 + coords.y2) / 2;
+        int32_t half_size = std::min(coords.x2 - coords.x1, coords.y2 - coords.y1) / 2;
+
+        float t = self->phase_;
+        float e_val = self->energy_;
+
+        // Multi-harmonic organic voice wave modulation
+        float voice_wave = 0.0f;
+        if (self->speak_blend_ > 0.02f) {
+            float w = 0.50f * std::sin(t * 2.8f) +
+                      0.30f * std::sin(t * 5.3f + 1.1f) +
+                      0.20f * std::cos(t * 8.1f + 2.4f);
+            voice_wave = (0.5f + 0.5f * w) * self->speak_blend_;
+        }
+        float idle_breath = std::sin(t * 0.9f);
+        float base_r = static_cast<float>(half_size) * (0.60f + 0.025f * idle_breath + 0.09f * voice_wave + 0.03f * self->listen_blend_);
+        int32_t r_core = static_cast<int32_t>(base_r);
+
+        // Luxury color palette blending:
+        // Idle: Midnight Sapphire (0x0A1336 -> 0x1E3A8A -> 0x3B82F6)
+        // Listening: Electric Cyan / Deep Teal (0x062038 -> 0x0E7490 -> 0x22D3EE)
+        // Speaking: Royal Violet + Electric Blue + Cyan Aura (0x1B1045 -> 0x4F46E5 -> 0x38BDF8)
+        lv_color_t outer_glow_col = lv_color_hex(LerpHex(LerpHex(0x1E3A8A, 0x06B6D4, self->listen_blend_), 0x6366F1, self->speak_blend_));
+        lv_color_t core_dark      = lv_color_hex(LerpHex(LerpHex(0x070E28, 0x062336, self->listen_blend_), 0x130D36, self->speak_blend_));
+        lv_color_t core_mid       = lv_color_hex(LerpHex(LerpHex(0x162E7A, 0x0C5B78, self->listen_blend_), 0x3730A3, self->speak_blend_));
+        lv_color_t core_bright    = lv_color_hex(LerpHex(LerpHex(0x3B6EF5, 0x22D3EE, self->listen_blend_), 0x7C3AED, self->speak_blend_));
+        lv_color_t wave_col       = lv_color_hex(LerpHex(LerpHex(0x60A5FA, 0x38BDF8, self->listen_blend_), 0xA78BFA, self->speak_blend_ * 0.6f));
+
+        // 1. Soft ambient outer halo rings (AMOLED glow)
+        DrawCircle(layer, cx, cy, r_core + 34 + static_cast<int32_t>(voice_wave * 12), outer_glow_col, 22);
+        DrawCircle(layer, cx, cy, r_core + 20 + static_cast<int32_t>(voice_wave * 8), outer_glow_col, 42);
+        DrawCircle(layer, cx, cy, r_core + 8 + static_cast<int32_t>(voice_wave * 4), outer_glow_col, 68);
+
+        // 2. Rhythmic expanding sound-wave rings when speaking or listening
+        if (self->speak_blend_ > 0.05f || self->listen_blend_ > 0.05f) {
+            float activity = std::max(self->speak_blend_, self->listen_blend_ * 0.7f);
+            for (int w_idx = 0; w_idx < 3; ++w_idx) {
+                float p = std::fmod(t * (0.28f + 0.14f * self->speak_blend_) + w_idx * 0.333f, 1.0f);
+                int32_t wr = r_core + static_cast<int32_t>(p * (half_size - r_core + 6));
+                lv_opa_t wopa = static_cast<lv_opa_t>((1.0f - p) * (1.0f - p) * 180.0f * activity);
+                int32_t wthick = (w_idx == 0) ? 3 : 2;
+                DrawRing(layer, cx, cy, wr, wthick, wave_col, wopa);
+            }
+        }
+
+        // 3. Tap feedback ripple
+        if (self->tap_pulse_ > 0.02f) {
+            float inv = 1.0f - self->tap_pulse_;
+            int32_t tr = r_core + static_cast<int32_t>(inv * 46.0f);
+            lv_opa_t topa = static_cast<lv_opa_t>(self->tap_pulse_ * 220.0f);
+            DrawRing(layer, cx, cy, tr, 3, lv_color_hex(0xE0F2FE), topa);
+        }
+
+        // 4. Layered 3D luminous sphere core
+        DrawCircle(layer, cx, cy, r_core, core_dark, LV_OPA_COVER);
+        DrawCircle(layer, cx - r_core / 10, cy - r_core / 10, (r_core * 82) / 100, core_mid, 175);
+        DrawCircle(layer, cx - r_core / 6, cy - r_core / 6, (r_core * 52) / 100, core_bright, 145);
+        DrawCircle(layer, cx - r_core / 5, cy - r_core / 5, (r_core * 26) / 100, lv_color_hex(0x93C5FD), 70);
+
+        // Subtle rim light around the orb edge
+        DrawRing(layer, cx, cy, r_core, 2, wave_col, static_cast<lv_opa_t>(90 + e_val * 90));
+
+        // 5. 3D Rotating Fibonacci Particle Field (Back hemisphere first, then Front)
+        float cos_y = std::cos(self->rot_y_);
+        float sin_y = std::sin(self->rot_y_);
+        float tilt_x = 0.28f + 0.10f * std::sin(t * 0.45f);
+        float cos_x = std::cos(tilt_x);
+        float sin_x = std::sin(tilt_x);
+
+        float dot_orbit_r = base_r * 0.90f;
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < kNumParticles; ++i) {
+                const auto& pt = self->base_points_[i];
+
+                // Rotate around Y
+                float x1 = pt.x * cos_y + pt.z * sin_y;
+                float z1 = -pt.x * sin_y + pt.z * cos_y;
+                // Tilt around X
+                float y2 = pt.y * cos_x - z1 * sin_x;
+                float z2 = pt.y * sin_x + z1 * cos_x;
+
+                bool is_front = (z2 >= 0.0f);
+                if ((pass == 0 && is_front) || (pass == 1 && !is_front)) {
+                    continue;
+                }
+
+                // Individual particle rhythmic wave displacement when speaking
+                float ripple = 1.0f;
+                if (self->speak_blend_ > 0.02f) {
+                    float band = std::sin(pt.y * 5.0f - t * 4.5f + pt.x * 3.0f);
+                    ripple += 0.14f * band * voice_wave;
+                } else if (self->listen_blend_ > 0.02f) {
+                    float band = std::sin(pt.y * 4.0f - t * 2.5f);
+                    ripple += 0.05f * band * self->listen_blend_;
+                }
+
+                float depth = (z2 + 1.0f) * 0.5f; // 0 (back) .. 1 (front)
+                float persp = 0.86f + 0.22f * depth;
+
+                int32_t px = cx + static_cast<int32_t>(x1 * dot_orbit_r * ripple * persp);
+                int32_t py = cy + static_cast<int32_t>(y2 * dot_orbit_r * ripple * persp);
+
+                int32_t dot_r = is_front
+                    ? static_cast<int32_t>(2.8f + depth * 3.0f + voice_wave * 1.4f)
+                    : static_cast<int32_t>(1.6f + depth * 1.8f);
+
+                lv_opa_t dot_opa = is_front
+                    ? static_cast<lv_opa_t>(135 + depth * 120)
+                    : static_cast<lv_opa_t>(40 + depth * 80);
+
+                lv_color_t dot_col = is_front
+                    ? LerpColor(0xBAE6FD, 0xFFFFFF, depth)
+                    : LerpColor(0x3B82F6, 0x93C5FD, depth);
+
+                if (is_front && depth > 0.65f) {
+                    // Subtle soft halo behind brightest front particles
+                    DrawCircle(layer, px, py, dot_r + 2, wave_col, static_cast<lv_opa_t>(dot_opa / 4));
+                }
+                DrawCircle(layer, px, py, dot_r, dot_col, dot_opa);
+            }
+        }
+    }
+
 public:
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
@@ -103,18 +389,51 @@ public:
                      bool swap_xy)
         : SpiLcdDisplay(io_handle, panel_handle,
                         width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
-        // Note: UI customization should be done in SetupUI(), not in constructor
-        // to ensure lvgl objects are created before accessing them
+        InitFibonacciSphere();
+    }
+
+    ~CustomLcdDisplay() {
+        if (orb_timer_) {
+            lv_timer_delete(orb_timer_);
+            orb_timer_ = nullptr;
+        }
     }
 
     virtual void SetupUI() override {
-        // Call parent SetupUI() first to create all lvgl objects
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
+        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+        ApplyAmoledBlackTheme();
+
+        // Create interactive 3D Particle & Voice-Wave Orb in the center
+        lv_obj_t* parent = emoji_box_ ? emoji_box_ : content_;
+        orb_obj_ = lv_obj_create(parent);
+        lv_obj_remove_style_all(orb_obj_);
+        lv_obj_set_size(orb_obj_, 310, 310);
+        lv_obj_center(orb_obj_);
+        lv_obj_add_flag(orb_obj_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(orb_obj_, orb_draw_cb, LV_EVENT_DRAW_MAIN, this);
+        lv_obj_add_event_cb(orb_obj_, orb_click_cb, LV_EVENT_CLICKED, this);
+
+        orb_timer_ = lv_timer_create(orb_timer_cb, 33, this);
+    }
+
+    virtual bool SetEmotion(const char* emotion) override {
+        // Keep our 3D glowing orb visible instead of default emoji faces
+        DisplayLockGuard lock(this);
+        if (emoji_label_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        if (emoji_image_) lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        return true;
+    }
+
+    virtual void SetTheme(Theme* theme) override {
+        SpiLcdDisplay::SetTheme(theme);
+        DisplayLockGuard lock(this);
+        ApplyAmoledBlackTheme();
     }
 };
 
